@@ -198,10 +198,8 @@ class LMCacheEngine:
         # NOTE(ApostaC): we haven't support lookup-cache yet
         self.lookup_cache: dict[CacheEngineKey, Any] = {}
 
-        # lookup_id -> {location -> [pinned keys]}
-        self.lookup_pins: dict[str, dict[str, list]] = defaultdict(
-            lambda: defaultdict(list)
-        )
+        # lookup_id -> [pinned keys]
+        self.lookup_pins: dict[str, list] = defaultdict(list)
 
         InitializeUsageContext(config.to_original_config(), metadata)
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
@@ -796,20 +794,20 @@ class LMCacheEngine:
                     # of one layer
                     key_all_layers = key.split_layers(self.num_layers)
 
-                    hit_chunks, block_mapping = self.storage_manager.batched_contains(
-                        key_all_layers,  # type: ignore
-                        search_range,
-                        pin,
-                    )
-                    # Only all layers are hit and hit in one location,
-                    # we consider this key as a hit
-                    if hit_chunks == self.num_layers and len(block_mapping) == 1:
+                    found = False
+                    for key_single_layer in key_all_layers:
+                        if self.storage_manager.contains(
+                            key_single_layer, search_range, pin
+                        ):
+                            found = True
+                    if found:
                         if pin:
                             assert lookup_id is not None, (
                                 "lookup_id is required when pin is True"
                             )
-                            location = next(iter(block_mapping.keys()))
-                            self.lookup_pins[lookup_id][location].extend(key_all_layers)
+                            self.lookup_pins[lookup_id].extend(  # type: ignore
+                                key_all_layers
+                            )
                         res = end
                         continue
                     return res
@@ -822,16 +820,16 @@ class LMCacheEngine:
                     keys.append(chunk_info[2])
 
                 # hit chunks by prefix matching
-                hit_chunks, block_mapping = self.storage_manager.batched_contains(
+                hit_chunks = self.storage_manager.batched_contains(
                     keys, search_range, pin
                 )
-                if pin and block_mapping:
-                    assert lookup_id is not None, (
-                        "lookup_id is required when pin is True"
-                    )
-                    self.lookup_pins[lookup_id] = block_mapping
                 for idx, (start, end, key) in enumerate(chunk_info_list):
                     if idx < hit_chunks:
+                        if pin:
+                            assert lookup_id is not None, (
+                                "lookup_id is required when pin is True"
+                            )
+                            self.lookup_pins[lookup_id].append(key)
                         res = end
                         continue
                     return res
@@ -860,7 +858,7 @@ class LMCacheEngine:
 
         num_tokens = self.lookup(
             tokens,
-            search_range=[old_position],
+            search_range=old_position,
             lookup_id=event_id,
             pin=True,
         )
@@ -869,9 +867,7 @@ class LMCacheEngine:
             logger.debug("Move is not performed as there are no tokens to move.")
             return 0
 
-        block_mapping = self.lookup_pins[event_id]
-        assert len(block_mapping) == 1
-        keys = block_mapping[old_position]
+        keys = self.lookup_pins[event_id]
 
         memory_objs = self.storage_manager.batched_get(
             keys=keys,
@@ -887,7 +883,7 @@ class LMCacheEngine:
         offsets = [m.meta.shape[token_dim] for m in memory_objs]  # type: ignore
 
         transfer_spec = {
-            "target_peer_init_url": new_position[0],
+            "peer_init_url": new_position[0],
             "offsets": offsets,
         }
 
@@ -1022,9 +1018,7 @@ class LMCacheEngine:
             logger.debug("Move is not performed as there are no tokens to move.")
             return 0
 
-        block_mapping = self.lookup_pins[event_id]
-        assert len(block_mapping) == 1
-        keys = block_mapping[location]
+        keys = self.lookup_pins[event_id]
 
         memory_objs = self.storage_manager.batched_get(
             keys=keys,
@@ -1080,9 +1074,7 @@ class LMCacheEngine:
             logger.debug("there are no tokens to decompress.")
             return 0
 
-        block_mapping = self.lookup_pins[event_id]
-        assert len(block_mapping) == 1
-        keys = block_mapping[location]
+        keys = self.lookup_pins[event_id]
 
         compressed_memory_objs = self.storage_manager.batched_get(
             keys=keys,
@@ -1115,8 +1107,8 @@ class LMCacheEngine:
     def lookup_unpin(self, lookup_id: str) -> None:
         if lookup_id in self.lookup_pins:
             assert self.storage_manager is not None
-            for location, keys in self.lookup_pins.pop(lookup_id).items():
-                self.storage_manager.batched_unpin(keys, [location])
+            self.storage_manager.batched_unpin(self.lookup_pins[lookup_id])
+            del self.lookup_pins[lookup_id]
 
     @_lmcache_nvtx_annotate
     def clear(
@@ -1319,6 +1311,13 @@ class LMCacheEngine:
                 reordered_chunks.append((key, memory_obj, start, end))
                 tot_kv_size += memory_obj.get_size()
                 ret_mask[start:end] = True
+
+            if last_failed_block_start is not None:
+                for (key, start, end), memory_obj in zip(
+                    blocks, memory_objs, strict=False
+                ):
+                    if memory_obj is not None and start >= last_failed_block_start:
+                        memory_obj.ref_count_down()
 
         if last_failed_block_start is not None:
             ret_mask[last_failed_block_start:] = False
