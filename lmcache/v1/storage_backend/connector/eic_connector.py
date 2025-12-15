@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from enum import IntEnum, auto
-from typing import List, Optional, Union, no_type_check
+from typing import List, Optional, Union, cast, no_type_check
 import asyncio
 import ctypes
 import os
@@ -179,6 +179,9 @@ class EICConnector(RemoteConnector):
         eic_flag_file = config.get("eic_flag_file", None)
         logger.info(f"eic flag_file: {eic_flag_file}")
 
+        self.eic_batch_put = config.get("eic_batch_put", False)
+        logger.info(f"eic use batch put: {self.eic_batch_put}")
+
         _make_dir(eic_log_dir)
 
         self.connection = eic.Client()
@@ -325,12 +328,12 @@ class EICConnector(RemoteConnector):
             if err_code == eic.StatusCode.KEY_NOT_EXIST:
                 logger.debug(
                     f"eic mget meta {key_str} failed, status_code {status_code}"
-                    " err_code {err_code}"
+                    f" err_code {err_code}"
                 )
             else:
                 logger.error(
                     f"eic mget meta {key_str} failed, status_code {status_code}"
-                    " err_code {err_code}"
+                    f" err_code {err_code}"
                 )
             return None
         else:
@@ -359,7 +362,7 @@ class EICConnector(RemoteConnector):
         if memory_obj is None:
             logger.error(
                 f"fail to allocate memory during remote receive key {key_str} length"
-                " {meta.length}"
+                f" {meta.length}"
             )
             return None
         perf_timer.stop("alloc_obj")
@@ -389,8 +392,10 @@ class EICConnector(RemoteConnector):
         if status_code != eic.StatusCode.SUCCESS or err_code != eic.StatusCode.SUCCESS:
             logger.error(
                 f"eic mget data {key_str} failed, status_code {status_code}"
-                " err_code {err_code}"
+                f" err_code {err_code}"
             )
+            # eic has fill some data to data_ptr
+            memory_obj.ref_count_down()
             return None
         else:
             logger.debug(f"eic mget data {key_str} success")
@@ -475,7 +480,7 @@ class EICConnector(RemoteConnector):
 
         logger.debug(
             f"eic put {key_str} meta ptr {meta_ptr} len {meta_size} data ptr {data_ptr}"
-            " len {data_size}"
+            f" len {data_size}"
         )
 
         perf_timer.start("eic_mset")
@@ -556,7 +561,7 @@ class EICConnector(RemoteConnector):
 
             logger.info(
                 f"eic batched_put {key_str} shape {kv_shape} dtype {kv_dtype}"
-                " fmt {memory_format}"
+                f" fmt {memory_format}"
             )
 
             # Add meta key & value
@@ -578,6 +583,8 @@ class EICConnector(RemoteConnector):
             eic_keys, eic_vals, set_option
         )
 
+        for memory_obj in memory_objs:
+            memory_obj.ref_count_down()
         if set_status_code != eic.StatusCode.SUCCESS:
             logger.error(
                 f"eic batched_put mset data failed, status_code {set_status_code}"
@@ -605,7 +612,7 @@ class EICConnector(RemoteConnector):
         )
 
     def support_batched_put(self) -> bool:
-        return False
+        return self.eic_batch_put
 
     async def batched_put(
         self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj]
@@ -655,7 +662,7 @@ class EICConnector(RemoteConnector):
             if status_code != eic.StatusCode.SUCCESS:
                 logger.debug(
                     f"eic batched_async_contains {key.to_string()} miss,"
-                    " err_code {status_code}"
+                    f" err_code {status_code}"
                 )
                 break
             num_hit_counts += 1
@@ -710,9 +717,15 @@ class EICConnector(RemoteConnector):
         lookup_id: str,
         keys: List[CacheEngineKey],
     ) -> List[MemoryObj]:
-        # calling self.get will create a circular dependency
         results = await asyncio.gather(*(self._get(key) for key in keys))
-        return [r for r in results if r is not None]
+        first_none_idx = results.index(None) if None in results else None
+        if first_none_idx is None:
+            return cast(List[MemoryObj], results)
+        for obj in results[first_none_idx + 1 :]:
+            if obj is not None:
+                obj.ref_count_down()
+
+        return cast(List[MemoryObj], results[:first_none_idx])
 
     async def batched_get_non_blocking(
         self,
